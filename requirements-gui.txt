@@ -1,0 +1,2 @@
+# Qt Widgets provides the optional desktop interface; the CLI uses the stdlib.
+PySide6-Essentials>=6.8,<7
