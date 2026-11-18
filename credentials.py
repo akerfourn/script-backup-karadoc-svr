@@ -6,6 +6,7 @@ import socket
 import socketserver
 import tempfile
 import threading
+from contextlib import ExitStack
 from pathlib import Path
 
 
@@ -54,17 +55,24 @@ class CredentialServer(socketserver.ThreadingUnixStreamServer):
 class CredentialSession:
     """Own a private socket and remove it when the operation ends."""
 
-    def __init__(self, secrets: dict[str, str]) -> None:
+    def __init__(self, secrets: dict[str, str], owner_uid: int | None = None) -> None:
         for secret in secrets.values():
             if "\n" in secret or "\r" in secret or "\x00" in secret:
                 raise ValueError("Un mot de passe ne doit pas contenir de saut de ligne ou de NUL.")
         self.directory = tempfile.TemporaryDirectory(prefix="backup-auth-")
         self.socket_path = Path(self.directory.name) / "credentials.sock"
         self.control_path = Path(self.directory.name) / "ssh.sock"
-        self.server = CredentialServer(str(self.socket_path), secrets)
-        self.socket_path.chmod(0o600)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-        self.thread.start()
+        with ExitStack() as cleanup:
+            cleanup.callback(self.directory.cleanup)
+            self.server = CredentialServer(str(self.socket_path), secrets)
+            cleanup.callback(self.server.server_close)
+            self.socket_path.chmod(0o600)
+            if owner_uid is not None:
+                os.chown(self.socket_path, owner_uid, -1)
+                os.chown(self.socket_path.parent, owner_uid, -1)
+            self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+            self.thread.start()
+            cleanup.pop_all()
 
     def cancel(self) -> None:
         """Prevent the receiving process from starting another transfer phase."""

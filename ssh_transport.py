@@ -48,7 +48,7 @@ class SudoHandshake:
                 raise ValueError("Mot de passe sudo distant refusé.")
             password = request_secret("sudo-remote")
             if password == "":
-                raise ValueError("Renseigner le mot de passe sudo distant dans l'interface.")
+                raise ValueError("Renseigner le mot de passe sudo distant.")
             input_stream.write(password.encode("utf-8") + b"\n")
             input_stream.flush()
             self.password_sent = True

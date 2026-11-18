@@ -139,9 +139,9 @@ temporaires contenant les mots de passe.
   `home/` est créé. Une simulation ne crée aucun répertoire.
 - Connexion SSH fonctionnelle, avec la clé du serveur déjà vérifiée.
 - Le compte distant doit pouvoir lire les sources, ou disposer de sudo.
-  L'interface gère son mot de passe. La ligne de commande utilise par défaut
-  une clé SSH et sudo **sans interaction** ; elle échoue si un mot de passe
-  est nécessaire. Les scripts ne modifient aucune règle sudo.
+  La ligne de commande utilise SSH et sudo **sans interaction** par défaut.
+  L'interface et l'option `--interactive-sudo` prennent en charge le mot de
+  passe sudo distant. Les scripts ne modifient aucune règle sudo.
 
 Un alias dans `~/.ssh/config` permet de définir le serveur, le port et la clé.
 Les exemples utilisent `ermont` et `/media/backup` : remplacer ces valeurs
@@ -194,9 +194,10 @@ touch ~/.ssh/config
 chmod 600 ~/.ssh/config
 ```
 
-Pour autoriser les mots de passe SSH dans une exécution en terminal,
-ajouter `--interactive-ssh`. Cette option ne gère pas le mot de passe sudo
-distant ; l'interface le prend en charge.
+En terminal, `--interactive-ssh` autorise la saisie du mot de passe SSH.
+Ajouter `--interactive-sudo` si le serveur demande aussi un mot de passe pour
+sudo. Le script demande ce dernier séparément, puis ouvre une connexion SSH
+partagée et garde le mot de passe sudo en mémoire pendant l'opération.
 
 ## Sauvegarde complète
 
@@ -232,6 +233,55 @@ sudo --preserve-env=SSH_AUTH_SOCK \
 sudo --preserve-env=SSH_AUTH_SOCK \
   ./backup.small.sh ermont /media/backup
 ```
+
+## Miroir des fichiers LiteCloud
+
+Le profil `--litecloud` synchronise `/var/lib/litecloud/data/` vers le dossier
+`litecloud/` du disque. Il reprend les fichiers déjà présents dans
+`litecloud/users/<id>/files/` et copie aussi les corbeilles et les fichiers
+cachés, dont `.mfa-key` si elle est présente. Le serveur peut rester en service.
+Le profil vérifie la présence d'au moins un dossier `users/<id>/files/` valide
+avant de lancer rsync. Une installation avec un autre chemin peut le préciser
+avec `--data-dir`.
+
+La base SQLite, ses fichiers de journal et `.instance.lock` sont exclus du
+transfert. Une copie de la base déjà présente sur le disque est protégée des
+suppressions de rsync. Le fichier `litecloud-comptes.tsv` peut rester à la
+racine du disque, à côté du miroir.
+
+Simuler, puis synchroniser en vérifiant les suppressions prévues :
+
+```bash
+sudo --preserve-env=SSH_AUTH_SOCK \
+  python3 backup.py mirror ermont /media/backup --litecloud --dry-run
+sudo --preserve-env=SSH_AUTH_SOCK \
+  python3 backup.py mirror ermont /media/backup --litecloud --progress
+```
+
+Ce profil est accessible en ligne de commande. Pour un compte distant qui
+peut lire le stockage directement, ajouter `--no-remote-sudo`.
+
+Ajouter `--no-delete` pour conserver les fichiers déjà présents sur le disque
+qui ont disparu du serveur. Rsync copie toujours les fichiers nouveaux ou
+modifiés et signale les erreurs de lecture, y compris en simulation.
+
+## Export SQLite LiteCloud à chaud
+
+Après le miroir des fichiers, exporter la base avec le service LiteCloud
+en cours d'exécution. Le serveur doit avoir Python 3 avec son module
+standard `sqlite3`. L'export inclut les transactions validées dans le WAL.
+
+```bash
+sudo --preserve-env=SSH_AUTH_SOCK \
+  python3 backup.py backup-litecloud-db ermont /media/backup \
+  --interactive-ssh --interactive-sudo
+```
+
+La commande vérifie la base reçue avant de la placer dans
+`litecloud/litecloud.sqlite3`. Le fichier est créé avec les droits `0600`.
+Un transfert interrompu ou un fichier
+invalide laisse l'ancienne copie en place. La base et le miroir représentent
+des instants différents si le serveur évolue entre les deux opérations.
 
 ## Préparation Nextcloud seule
 

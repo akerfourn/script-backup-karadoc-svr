@@ -6,8 +6,10 @@ import ctypes
 import io
 import os
 import shutil
+import sqlite3
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -24,6 +26,8 @@ import shlex
 import sys
 
 arguments = sys.argv[1:]
+if "-M" in arguments or "-O" in arguments:
+    sys.exit(0)
 while arguments[0] in ("-o", "-S", "-l"):
     arguments = arguments[2:]
 if arguments[0] == "--":
@@ -156,6 +160,11 @@ class DestinationTests(unittest.TestCase):
 
 
 class SourceDirectoryTests(unittest.TestCase):
+    def test_litecloud_profile_should_use_the_debian_data_directory_by_default(self) -> None:
+        options = backup.parse_arguments(["mirror", "server", "/media/backup", "--litecloud"])
+
+        self.assertEqual(backup.mirror_sources(options), [("/var/lib/litecloud/data", "litecloud")])
+
     def test_source_directory_should_refuse_root_with_any_number_of_slashes(self) -> None:
         for directory in ("/", "//", "///"):
             with self.subTest(directory=directory):
@@ -253,6 +262,30 @@ class MirrorTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertEqual(directory_contents(self.destination / name), directory_contents(source))
 
+    def test_cli_should_authenticate_remote_sudo_when_simulating_with_a_password(self) -> None:
+        (self.root / "bin" / "sudo").write_text(PASSWORD_SUDO, encoding="utf-8")
+        ticket = self.root / "sudo-ticket"
+        before = directory_contents(self.destination)
+        arguments = [
+            "mirror", "remote-user@fake-server", str(self.destination),
+            "--home-only", "--home-dir", str(self.sources["home"]),
+            "--interactive-ssh", "--interactive-sudo", "--dry-run",
+        ]
+
+        with (
+            patch.dict(os.environ, {"BACKUP_TEST_SUDO_TICKET": str(ticket)}),
+            patch("backup.os.path.ismount", return_value=True),
+            patch("backup.os.geteuid", return_value=0),
+            patch("backup.getpass.getpass", return_value="sudo-test-password") as prompt,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            result = backup.main(arguments)
+
+        self.assertEqual(result, 0)
+        self.assertTrue(ticket.is_file())
+        prompt.assert_called_once_with("Mot de passe sudo distant (remote-user@fake-server) : ")
+        self.assertEqual(directory_contents(self.destination), before)
+
     def test_mirror_should_support_an_explicit_remote_username(self) -> None:
         self.options.host = "remote-user@fake-server"
 
@@ -316,6 +349,79 @@ class MirrorTests(unittest.TestCase):
         self.assertEqual(directory_contents(self.destination / "home"), directory_contents(self.sources["home"]))
         self.assertEqual(directory_contents(self.destination / "nextcloud"), nextcloud_before)
         self.assertEqual(directory_contents(self.destination / "config"), config_before)
+
+    def test_litecloud_mirror_should_copy_data_and_preserve_local_database_files(self) -> None:
+        source = self.root / "server" / "litecloud data"
+        target = self.destination / "litecloud"
+        account = Path("users") / ("a" * 64)
+        (source / account / "files").mkdir(parents=True)
+        (source / account / "trash").mkdir()
+        (source / account / "files" / "document.txt").write_bytes(b"already on disk")
+        (source / account / "files" / "litecloud.sqlite3").write_bytes(b"user document")
+        (source / account / "trash" / "old.txt").write_bytes(b"trash")
+        (source / ".mfa-key").write_bytes(b"test key")
+        (source / "litecloud.sqlite3").write_bytes(b"live database")
+        (source / "litecloud.sqlite3-wal").write_bytes(b"live journal")
+        (source / ".instance.lock").touch()
+        (target / account / "files").mkdir(parents=True)
+        existing_file = target / account / "files" / "document.txt"
+        shutil.copy2(source / account / "files" / "document.txt", existing_file)
+        existing_inode = existing_file.stat().st_ino
+        (target / account / "files" / "obsolete.txt").touch()
+        (target / "litecloud.sqlite3").write_bytes(b"previous snapshot")
+        (target / "litecloud.sqlite3-shm").write_bytes(b"existing sidecar")
+        (self.destination / "litecloud-comptes.tsv").write_bytes(b"account mapping")
+        self.options = backup.parse_arguments([
+            "mirror", "fake-server", str(self.destination), "--litecloud", "--no-remote-sudo",
+            "--data-dir", str(source),
+        ])
+
+        self.run_mirror()
+
+        self.assertEqual(directory_contents(target), {
+            str(account / "files" / "document.txt"): b"already on disk",
+            str(account / "files" / "litecloud.sqlite3"): b"user document",
+            str(account / "trash" / "old.txt"): b"trash",
+            ".mfa-key": b"test key",
+            "litecloud.sqlite3": b"previous snapshot",
+            "litecloud.sqlite3-shm": b"existing sidecar",
+        })
+        self.assertEqual(existing_file.stat().st_ino, existing_inode)
+        self.assertEqual((self.destination / "litecloud-comptes.tsv").read_bytes(), b"account mapping")
+
+    def test_litecloud_mirror_should_refuse_a_source_without_account_directories(self) -> None:
+        source = self.root / "server" / "litecloud data"
+        (source / "users").mkdir(parents=True)
+        (source / "litecloud.sqlite3").touch()
+        self.options = backup.parse_arguments([
+            "mirror", "fake-server", str(self.destination), "--litecloud", "--no-remote-sudo",
+            "--data-dir", str(source),
+        ])
+
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.run_mirror()
+
+        self.assertFalse((self.destination / "litecloud").exists())
+
+    def test_litecloud_mirror_should_keep_local_only_files_when_deletion_is_disabled(self) -> None:
+        source = self.root / "server" / "litecloud"
+        account_files = Path("users") / ("a" * 64) / "files"
+        source_files = source / account_files
+        target_files = self.destination / "litecloud" / account_files
+        source_files.mkdir(parents=True)
+        target_files.mkdir(parents=True)
+        (source_files / "new.txt").write_bytes(b"server")
+        (target_files / "local.txt").write_bytes(b"keep this")
+        self.options = backup.parse_arguments([
+            "mirror", "fake-server", str(self.destination), "--litecloud", "--no-remote-sudo",
+            "--data-dir", str(source), "--no-delete",
+        ])
+
+        self.run_mirror()
+
+        self.assertEqual(directory_contents(target_files), {
+            "local.txt": b"keep this", "new.txt": b"server",
+        })
 
     def test_mirror_should_refuse_every_transfer_when_a_remote_source_is_missing(self) -> None:
         before = directory_contents(self.destination)
@@ -402,6 +508,51 @@ class MirrorTests(unittest.TestCase):
         self.assertEqual(directory_contents(self.destination / "home"), directory_contents(self.sources["home"]))
         self.assertEqual(directory_contents(self.destination / "nextcloud"), nextcloud_before)
         self.assertEqual(directory_contents(self.destination / "config"), config_before)
+
+
+    def test_online_export_should_include_committed_wal_changes(self) -> None:
+        source = self.root / "sqlite data"
+        source.mkdir()
+        (self.destination / "litecloud").mkdir()
+        snapshot = self.destination / "litecloud" / "litecloud.sqlite3"
+        arguments = [
+            "backup-litecloud-db", "fake-server", str(self.destination), "--data-dir",
+            str(source), "--no-remote-sudo",
+        ]
+
+        with contextlib.closing(sqlite3.connect(source / snapshot.name)) as live:
+            live.execute("PRAGMA journal_mode=WAL")
+            live.execute("PRAGMA wal_autocheckpoint=0")
+            live.execute("CREATE TABLE users (id TEXT PRIMARY KEY, username TEXT)")
+            live.execute("INSERT INTO users VALUES ('id', 'test-user')")
+            live.commit()
+            self.assertGreater((source / f"{snapshot.name}-wal").stat().st_size, 0)
+            with patch("backup.os.path.ismount", return_value=True):
+                self.assertEqual(backup.main(arguments), 0)
+
+        with contextlib.closing(sqlite3.connect(snapshot)) as copy:
+            self.assertEqual(copy.execute("SELECT id, username FROM users").fetchall(),
+                             [("id", "test-user")])
+            self.assertEqual(copy.execute("PRAGMA journal_mode").fetchone(), ("delete",))
+        self.assertEqual(stat.S_IMODE(snapshot.stat().st_mode), 0o600)
+
+    def test_invalid_download_should_preserve_the_previous_snapshot(self) -> None:
+        directory = self.destination / "litecloud"
+        directory.mkdir()
+        snapshot = directory / "litecloud.sqlite3"
+        snapshot.write_bytes(b"previous snapshot")
+        invalid_export = [sys.executable, "-c", "print('invalid database')"]
+
+        with (
+            patch("backup.os.path.ismount", return_value=True),
+            patch("backup.remote_script_command", return_value=invalid_export),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            result = backup.main(["backup-litecloud-db", "fake-server", str(self.destination)])
+
+        self.assertEqual(result, 1)
+        self.assertEqual(snapshot.read_bytes(), b"previous snapshot")
+        self.assertEqual(list(self.destination.glob(".litecloud-db-*")), [])
 
 
 class PreparationTests(unittest.TestCase):
