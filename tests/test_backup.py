@@ -536,6 +536,53 @@ class MirrorTests(unittest.TestCase):
             self.assertEqual(copy.execute("PRAGMA journal_mode").fetchone(), ("delete",))
         self.assertEqual(stat.S_IMODE(snapshot.stat().st_mode), 0o600)
 
+    def test_combined_litecloud_backup_should_mirror_files_before_exporting_sqlite(self) -> None:
+        source = self.root / "litecloud source"
+        relative_files = Path("users") / ("a" * 64) / "files"
+        source_files = source / relative_files
+        source_files.mkdir(parents=True)
+        (source_files / "new.txt").write_bytes(b"new")
+        target = self.destination / "litecloud"
+        target_files = target / relative_files
+        target_files.mkdir(parents=True)
+        (target_files / "archive.txt").write_bytes(b"keep")
+        database_path = source / "litecloud.sqlite3"
+        with contextlib.closing(sqlite3.connect(database_path)) as live:
+            live.execute("CREATE TABLE users (id TEXT PRIMARY KEY, username TEXT)")
+            live.commit()
+
+        export = backup.backup_litecloud_database
+
+        def export_after_mirror(options: argparse.Namespace) -> None:
+            self.assertEqual((target_files / "new.txt").read_bytes(), b"new")
+            self.assertEqual((target_files / "archive.txt").read_bytes(), b"keep")
+            self.assertFalse((target / database_path.name).exists())
+            export(options)
+
+        with (
+            patch("backup.os.path.ismount", return_value=True),
+            patch("backup.os.geteuid", return_value=0),
+            patch("backup.backup_litecloud_database", side_effect=export_after_mirror),
+        ):
+            result = backup.main([
+                "backup-litecloud", "fake-server", str(self.destination),
+                "--data-dir", str(source), "--no-remote-sudo",
+            ])
+
+        self.assertEqual(result, 0)
+        self.assertTrue((target / database_path.name).is_file())
+
+    def test_combined_litecloud_backup_should_skip_export_when_rsync_fails(self) -> None:
+        options = backup.parse_arguments(["backup-litecloud", "fake-server", str(self.destination)])
+        with (
+            patch("backup.os.path.ismount", return_value=True),
+            patch("backup.run_mirror", side_effect=subprocess.CalledProcessError(23, "rsync")),
+            patch("backup.backup_litecloud_database") as export,
+        ):
+            with self.assertRaises(subprocess.CalledProcessError):
+                backup.backup_litecloud(options)
+        export.assert_not_called()
+
     def test_invalid_download_should_preserve_the_previous_snapshot(self) -> None:
         directory = self.destination / "litecloud"
         directory.mkdir()

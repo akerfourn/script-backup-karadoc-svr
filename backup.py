@@ -125,14 +125,22 @@ def parse_arguments(arguments: list[str] | None = None) -> argparse.Namespace:
     commands.add_parser(
         "prepare-nextcloud", parents=[connection], help="rafraîchir le dump sur le serveur"
     )
-    database_parser = commands.add_parser(
-        "backup-litecloud-db", parents=[connection], help="sauvegarder SQLite à chaud"
-    )
-    database_parser.add_argument("destination", type=Path, help="point de montage local du disque")
-    database_parser.add_argument(
+    litecloud_arguments = argparse.ArgumentParser(add_help=False)
+    litecloud_arguments.add_argument("destination", type=Path, help="point de montage local du disque")
+    litecloud_arguments.add_argument(
         "--data-dir", type=remote_directory, default=DEFAULT_LITECLOUD_DATA_DIRECTORY,
         help="répertoire LiteCloud distant",
     )
+    commands.add_parser(
+        "backup-litecloud-db", parents=[connection, litecloud_arguments],
+        help="sauvegarder SQLite à chaud",
+    )
+    litecloud_parser = commands.add_parser(
+        "backup-litecloud", parents=[connection, litecloud_arguments],
+        help="synchroniser les fichiers LiteCloud puis sauvegarder SQLite à chaud",
+    )
+    litecloud_parser.set_defaults(litecloud=True, prepare_nextcloud=False, no_delete=True)
+    litecloud_parser.add_argument("--progress", action="store_true", help="afficher la progression rsync")
     options = parser.parse_args(arguments)
     if options.command == "mirror":
         if options.home_only and options.prepare_nextcloud:
@@ -157,7 +165,7 @@ def local_ssh_user(options: argparse.Namespace) -> str | None:
     return os.environ.get("SUDO_USER")
 
 
-def ssh_command(options: argparse.Namespace) -> list[str]:
+def ssh_command(options: argparse.Namespace, askpass: Path | None = None) -> list[str]:
     """Keep the invoking user's SSH configuration when launched through sudo."""
     if options.remote_sudo_password:
         command = [
@@ -174,6 +182,11 @@ def ssh_command(options: argparse.Namespace) -> list[str]:
         ]
         if options.ssh_control_path is not None:
             command.extend(["-S", options.ssh_control_path, "-o", "ControlMaster=no"])
+        if askpass is not None:
+            command = [
+                "env", f"SSH_ASKPASS={askpass}", "SSH_ASKPASS_REQUIRE=force",
+                *command, "-o", "StrictHostKeyChecking=yes", "-o", "NumberOfPasswordPrompts=1",
+            ]
     ssh_user = local_ssh_user(options)
     if ssh_user is not None and ssh_user != "root":
         if os.geteuid() != 0:
@@ -196,7 +209,9 @@ def prompt_remote_sudo_password(host: str) -> str:
 
 
 @contextmanager
-def interactive_sudo_session(options: argparse.Namespace) -> Iterator[argparse.Namespace]:
+def interactive_sudo_session(
+    options: argparse.Namespace, passwords: dict[str, str] | None = None,
+) -> Iterator[argparse.Namespace]:
     """Reuse one SSH login and the private sudo credential socket for the CLI."""
     ssh = ssh_command(options)
     ssh_user = local_ssh_user(options)
@@ -208,13 +223,25 @@ def interactive_sudo_session(options: argparse.Namespace) -> Iterator[argparse.N
             raise ValueError(f"Compte SSH local introuvable : {ssh_user}") from error
 
     previous_socket = os.environ.get(SOCKET_ENVIRONMENT_VARIABLE)
-    password = prompt_remote_sudo_password(options.host)
-    with closing(CredentialSession({"sudo-remote": password}, owner_uid=owner_uid)) as credentials:
+    use_askpass = passwords is not None
+    if passwords is None:
+        passwords = {"sudo-remote": prompt_remote_sudo_password(options.host)}
+    with closing(CredentialSession(passwords, owner_uid=owner_uid)) as credentials:
         control_path = str(credentials.control_path)
-        master = [*ssh, "-S", control_path, "-M", "-N", "-f", "-o", "ControlPersist=60"]
+        start_ssh = ssh
+        if use_askpass:
+            askpass = credentials.control_path.with_name("ssh-askpass")
+            helper = ["python3", str(PROJECT_DIRECTORY / "lib" / "askpass.py"), "ssh"]
+            descriptor = os.open(askpass, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o700)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as launcher:
+                launcher.write("#!/bin/sh\nexec " + shlex.join(helper) + '\n')
+                if owner_uid is not None:
+                    os.fchown(launcher.fileno(), owner_uid, -1)
+            start_ssh = ssh_command(options, askpass=askpass)
+        master = [*start_ssh, "-S", control_path, "-M", "-N", "-f", "-o", "ControlPersist=60"]
         try:
-            subprocess.run([*master, "--", options.host], check=True)
             os.environ[SOCKET_ENVIRONMENT_VARIABLE] = str(credentials.socket_path)
+            subprocess.run([*master, "--", options.host], check=True)
             connected = argparse.Namespace(**vars(options))
             connected.ssh_control_path = control_path
             connected.remote_sudo_password = True
@@ -368,21 +395,29 @@ def run_mirror(options: argparse.Namespace) -> None:
     check_cancelled()
 
 
-def backup_litecloud_database(options: argparse.Namespace) -> None:
-    """Receive and verify a standalone SQLite snapshot before publishing it."""
+def litecloud_snapshot_path(options: argparse.Namespace, allow_missing: bool = False) -> Path:
+    """Validate the backup volume and the destination of the SQLite snapshot."""
     destination = validate_destination(
-        options.destination, ["litecloud"], require_writable=not options.dry_run
+        options.destination, ["litecloud"], require_writable=not options.dry_run,
+        allow_missing=allow_missing,
     )
     directory = destination / "litecloud"
-    if directory.stat().st_dev != destination.stat().st_dev:
+    if directory.exists() and directory.stat().st_dev != destination.stat().st_dev:
         raise ValueError("le dossier litecloud doit être sur le disque de sauvegarde")
-    snapshot = directory / LITECLOUD_DATABASE
     for suffix in ("-wal", "-shm", "-journal"):
         if os.path.lexists(directory / f"{LITECLOUD_DATABASE}{suffix}"):
             raise ValueError(f"journal SQLite présent à côté de la sauvegarde : {suffix}")
+    return directory / LITECLOUD_DATABASE
+
+
+def backup_litecloud_database(options: argparse.Namespace) -> None:
+    """Receive and verify a standalone SQLite snapshot before publishing it."""
+    snapshot = litecloud_snapshot_path(options, allow_missing=options.dry_run)
     if options.dry_run:
         print(f"Simulation : sauvegarde SQLite prévue vers {snapshot}", flush=True)
         return
+    directory = snapshot.parent
+    destination = directory.parent
 
     script = (PROJECT_DIRECTORY / "lib" / "export-litecloud-sqlite.py").read_bytes()
     source = str(PurePosixPath(options.data_dir) / LITECLOUD_DATABASE)
@@ -407,6 +442,14 @@ def backup_litecloud_database(options: argparse.Namespace) -> None:
     print(f"Base SQLite vérifiée : {snapshot}", flush=True)
 
 
+def backup_litecloud(options: argparse.Namespace) -> None:
+    """Back up the files first, then export SQLite on the same SSH session."""
+    litecloud_snapshot_path(options, allow_missing=True)
+    run_mirror(options)
+    check_cancelled()
+    backup_litecloud_database(options)
+
+
 def main(arguments: list[str] | None = None) -> int:
     """Run the CLI and stop on the first failure."""
     options = parse_arguments(arguments)
@@ -418,14 +461,16 @@ def main(arguments: list[str] | None = None) -> int:
             if shutil.which(program) is None:
                 raise ValueError(f"commande requise introuvable : {program}")
         operation = prepare_nextcloud
-        if options.command == "mirror":
+        if options.command in ("mirror", "backup-litecloud"):
             if os.geteuid() != 0:
                 raise ValueError("lancer avec sudo pour conserver propriétaires et permissions")
-            operation = run_mirror
+            operation = run_mirror if options.command == "mirror" else backup_litecloud
         elif options.command == "backup-litecloud-db":
             operation = backup_litecloud_database
         authentication = nullcontext(options)
-        if options.interactive_sudo and (options.command == "mirror" or not options.dry_run):
+        if options.interactive_sudo and (
+            options.command in ("mirror", "backup-litecloud") or not options.dry_run
+        ):
             authentication = interactive_sudo_session(options)
         with authentication as connected_options:
             operation(connected_options)

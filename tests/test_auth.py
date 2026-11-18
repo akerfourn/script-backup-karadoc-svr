@@ -111,6 +111,32 @@ class GuiSessionTests(unittest.TestCase):
 
 
 class SshErrorTests(unittest.TestCase):
+    def test_supplied_passwords_should_reach_ssh_and_sudo_through_the_private_socket(self) -> None:
+        options = backup.parse_arguments([
+            "backup-litecloud", "server", "/media/backup", "--interactive-ssh",
+        ])
+        run = subprocess.run
+        passwords = {"ssh": "test-ssh", "sudo-remote": "test-sudo"}
+
+        def fake_ssh(command: list[str], **_kwargs: object) -> None:
+            for secret in passwords.values():
+                self.assertNotIn(secret, repr(command))
+                self.assertNotIn(secret, repr(dict(os.environ)))
+            if "-M" in command:
+                helper = next(arg.split("=", 1)[1] for arg in command
+                              if arg.startswith("SSH_ASKPASS="))
+                result = run([helper], capture_output=True, check=True, text=True)
+                self.assertEqual(result.stdout, "test-ssh\n")
+                self.assertEqual(request_secret("sudo-remote"), "test-sudo")
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("backup.subprocess.run", side_effect=fake_ssh) as ssh,
+            backup.interactive_sudo_session(options, passwords) as session,
+        ):
+            self.assertTrue(session.remote_sudo_password)
+        self.assertEqual(ssh.call_count, 2)
+
     def test_cli_should_explain_batch_authentication_when_ssh_fails(self) -> None:
         output = io.StringIO()
         with patch("backup.shutil.which", return_value="/usr/bin/tool"):

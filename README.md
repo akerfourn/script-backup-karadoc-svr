@@ -81,52 +81,38 @@ relire des données : la reprise n'est pas forcément instantanée.
 Le miroir reste partiellement actualisé jusqu'à une synchronisation
 complète, et la reprise tient compte de l'état actuel du serveur.
 
-## Utilisation depuis Windows avec WSL (conception)
+## Interface Windows pour LiteCloud
 
-Le programme n'est pas porté sous Windows natif. Le principe envisagé est
-de conserver le moteur Linux actuel et d'ajouter un lanceur Windows qui
-confie la sauvegarde à une distribution WSL 2. Cette fonctionnalité n'est
-pas encore implémentée.
+Prérequis sous Windows : Python 3.10+ avec Tkinter, `usbipd-win` et WSL 2.
+La distribution WSL doit disposer de Python 3, rsync, OpenSSH et util-linux.
+Depuis PowerShell, à la racine du projet :
 
-Le déroulement prévu est le suivant :
+```powershell
+python windows_backup.py
+```
 
-1. Le lanceur identifie le disque USB par son modèle, sa capacité et, si
-   disponible, son numéro de série. Il demande une validation si l'identité
-   du disque ne correspond pas à celle enregistrée.
-2. Il attache le périphérique USB à WSL avec `usbipd`.
-3. Un script Linux dans WSL repère la partition ext4 attendue, la monte,
-   puis lance la sauvegarde existante sur son point de montage Linux.
-4. Le lanceur affiche la progression et les erreurs, puis attend la fin
-   effective de rsync.
-5. Après la sauvegarde, le script démonte proprement la partition. Le
-   lanceur détache ensuite le périphérique USB de WSL.
+Sélectionner le périphérique USB et saisir l'UUID de la partition ext4,
+visible avec `lsblk -f` dans WSL lorsque le disque est attaché. Renseigner
+le serveur SSH et les mots de passe dans la fenêtre. Le premier partage USB
+peut déclencher une invite administrateur Windows. Vérifier l'empreinte SSH
+du serveur lors d'une connexion normale dans la distribution WSL.
 
-La commande WSL `wsl --mount` ne prend pas directement en charge les
-périphériques USB. Le rattachement d'un disque USB à WSL 2 passe par
-[USB/IP avec usbipd-win](https://learn.microsoft.com/fr-fr/windows/wsl/connect-usb).
-Le périphérique attaché n'est alors plus disponible pour les applications
-Windows. La procédure Microsoft demande des droits administrateur pour
-`usbipd bind`; l'attachement courant peut ensuite être lancé sans élévation.
-Pour un disque ext4 qui n'est pas USB, WSL peut aussi le monter avec
-[`wsl --mount`](https://learn.microsoft.com/fr-fr/windows/wsl/wsl2-mount-disk).
-Ces deux méthodes nécessitent WSL 2 ; la méthode USB nécessite aussi
-`usbipd-win` installé sous Windows.
+La simulation est cochée par défaut. Le lanceur attache le disque, attend
+jusqu'à 90 secondes que la partition apparaisse et la monte sur
+`/media/backup`. Le journal affiche la progression de rsync et de l'export
+SQLite. Le montage créé par le lanceur est démonté après l'opération et
+l'USB est détaché si le démontage a été confirmé. Un montage manuel
+correspondant est réutilisé. Pour une sauvegarde réelle, ce montage doit
+être en lecture-écriture.
 
-Le lanceur ne doit jamais choisir un disque uniquement à partir d'un nom
-comme `/dev/sdb`, qui peut changer. Avant toute écriture, le script WSL doit
-vérifier l'identité et le système de fichiers, confirmer le point de montage
-et refuser les destinations inattendues. En cas d'erreur ou d'arrêt, il doit
-attendre la fermeture des processus rsync avant de démonter et détacher le
-disque. Une interruption de transfert laisse le miroir partiellement à jour ;
-les fichiers partiels rsync servent à la reprise.
+Les mots de passe passent par l'entrée standard privée du processus WSL.
+Le moteur les conserve en mémoire et les distribue via son socket Unix
+privé. Les champs sont vidés au lancement. La fenêtre attend la fin de
+l'opération avant de se fermer.
 
-Le GUI actuel conserve les mots de passe en mémoire et les transmet aux
-processus Linux par un socket Unix privé. Un GUI Windows séparé ne peut pas
-réutiliser directement ce mécanisme. La conception devra soit lancer le GUI
-Linux existant dans WSLg après l'attachement du disque, soit définir un canal
-de transmission des secrets entre le GUI Windows et WSL. L'authentification
-ne devra pas passer par les arguments de commande ni par des fichiers
-temporaires contenant les mots de passe.
+Les options `--host`, `--uuid` et `--distribution` permettent de préremplir
+les champs au lancement. Voir la
+[procédure USB/IP avec usbipd-win](https://learn.microsoft.com/fr-fr/windows/wsl/connect-usb).
 
 ## Prérequis
 
@@ -233,6 +219,22 @@ sudo --preserve-env=SSH_AUTH_SOCK \
 sudo --preserve-env=SSH_AUTH_SOCK \
   ./backup.small.sh ermont /media/backup
 ```
+
+## Sauvegarde LiteCloud en une commande
+
+Depuis Ubuntu sous WSL, monter le disque sur `/media/backup`, puis lancer :
+
+```bash
+sudo --preserve-env=SSH_AUTH_SOCK \
+  python3 backup.py backup-litecloud ermont /media/backup \
+  --interactive-ssh --interactive-sudo --progress
+```
+
+Remplacer `ermont` par l'alias ou l'adresse SSH du serveur. La commande garde
+une seule connexion SSH pour synchroniser les fichiers puis exporter SQLite
+à chaud. Elle conserve les fichiers présents uniquement sur le disque.
+L'export démarre si rsync se termine avec succès. Ajouter `--dry-run` pour
+simuler le miroir et afficher la destination prévue de la base.
 
 ## Miroir des fichiers LiteCloud
 
